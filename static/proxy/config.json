@@ -1,0 +1,10 @@
+{
+    "comercio": "369559141",
+    "terminal": "1",
+    "com_port": "COM9:,19200,N,8,1",
+    "timeout": 45,
+    "proxy_port": 8765,
+    "mgmt_ws_url": "ws://localhost:10200",
+    "pinpad_http_url": "http://localhost:9000",
+    "pinpad_ws_url": "ws://localhost:9000"
+}
