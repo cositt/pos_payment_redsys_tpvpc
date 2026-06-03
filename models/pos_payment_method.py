@@ -16,16 +16,30 @@ class PosPaymentMethod(models.Model):
     )
     redsys_proxy_url = fields.Char(
         string="URL Proxy Windows",
-        default="http://localhost:8765",
-        help="URL del proxy corriendo en el PC del kiosko (ej: http://10.0.1.50:8765)",
+        default="http://10.0.1.21:8765",
+        help="URL del proxy corriendo en el PC del kiosko (ej: http://10.0.1.21:8765)",
     )
     redsys_comercio = fields.Char(
         string="Código de Comercio",
-        help="Código de comercio asignado por el banco (ej: 369559141)",
+        default="369559141",
+        help="Código de comercio asignado por el banco",
     )
     redsys_terminal = fields.Char(
         string="Número de Terminal",
         default="1",
+    )
+    redsys_com_port = fields.Char(
+        string="Puerto COM Datáfono",
+        default="COM9:,19200,N,8,1",
+        help="Puerto serie del datáfono (ej: COM9:,19200,N,8,1)",
+    )
+    redsys_usuario = fields.Char(
+        string="Usuario Redsys",
+        help="Usuario de acceso a canales.redsys.es (ej: 3695591412100)",
+    )
+    redsys_password = fields.Char(
+        string="Password Redsys",
+        help="Contraseña de acceso a canales.redsys.es",
     )
     redsys_timeout = fields.Integer(
         string="Timeout (seg)",
@@ -68,7 +82,7 @@ class PosPaymentMethod(models.Model):
         self.ensure_one()
         return {
             "type": "ir.actions.act_url",
-            "url": "/pos/redsys/download_proxy",
+            "url": f"/pos/redsys/download_proxy?payment_method_id={self.id}",
             "target": "new",
         }
 
@@ -80,8 +94,9 @@ class PosPaymentMethod(models.Model):
                 json={
                     "amount": amount,
                     "invoice": invoice_ref,
-                    "comercio": method.redsys_comercio,
-                    "terminal": method.redsys_terminal,
+                    "comercio": method.redsys_comercio or "",
+                    "terminal": method.redsys_terminal or "1",
+                    "com_port": method.redsys_com_port or "COM9:,19200,N,8,1",
                     "timeout": method.redsys_timeout,
                 },
                 timeout=method.redsys_timeout + 10,

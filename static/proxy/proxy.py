@@ -11,8 +11,11 @@ Uso:
 Requiere: pip install -r requirements.txt
 """
 import asyncio
+import hashlib
 import json
 import logging
+import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -27,6 +30,10 @@ from pydantic import BaseModel
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("C:/RedsysProxy/proxy.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -47,8 +54,6 @@ MGMT_WS_URL = cfg.get("mgmt_ws_url", "ws://localhost:10200")
 PINPAD_HTTP_URL = cfg.get("pinpad_http_url", "http://localhost:9000")
 PINPAD_WS_URL = cfg.get("pinpad_ws_url", "ws://localhost:9000")
 WSDL_URL = "https://tpvpc.redsys.es/TPV_PC/services/SerClsWSPasarelaPINPAD/wsdl/SerClsWSPasarelaPINPAD.wsdl"
-SESSION_URL = "https://canales.redsys.es/canales/lacaixa/TPV_PC/validaSesion"
-JSESSIONID_FALLBACK = "0000aZfEEzH_IKInuzKzy605-D6:1be05rmv7"
 PROXY_PORT = cfg.get("proxy_port", 8765)
 
 # ---------------------------------------------------------------------------
@@ -57,6 +62,7 @@ PROXY_PORT = cfg.get("proxy_port", 8765)
 
 _initialized: bool = False
 _pinpad_ws: Optional[websockets.WebSocketClientProtocol] = None
+_mgmt_ws: Optional[websockets.WebSocketClientProtocol] = None
 _pending_future: Optional[asyncio.Future] = None
 _lock = asyncio.Lock()
 
@@ -86,51 +92,184 @@ async def _get_prop(name: str) -> str:
     return result.get("Response", "")
 
 # ---------------------------------------------------------------------------
+# Redsys login — obtiene jsessionid fresco via POST directo a tpvpc.redsys.es
+# ---------------------------------------------------------------------------
+
+SESSION_VALIDATE_URL = "https://tpvpc.redsys.es/TPV_PC/validaSesion"
+
+
+def _f5_cookie_value(f5_p: str, latency_ms: int = 500) -> str:
+    def set_char_at(s: str, index: int, c: str) -> str:
+        if index > len(s) - 1:
+            return s
+        return s[:index] + c + s[index + 1:]
+
+    def set_byte(s: str, i: int, b: int) -> str:
+        seg = (i // 16) * 32
+        i = i & 15
+        s = set_char_at(s, i + 16 + seg, chr((b >> 4) + 65))
+        s = set_char_at(s, i + seg, chr((b & 15) + 65))
+        return s
+
+    latency = latency_ms & 0xFFFF
+    s = f5_p
+    s = set_byte(s, 40, latency >> 8)
+    s = set_byte(s, 41, latency & 0xFF)
+    s = set_byte(s, 35, 2)
+    return s
+
+
+async def get_fresh_jsessionid(usuario: str, password: str) -> str:
+    login_base = "https://canales.redsys.es"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=headers) as client:
+        # STEP 1: Login canales.redsys.es
+        r = await client.get(f"{login_base}/canales/login",
+                             params={"Ico_Idioma": "1", "Ico_Prefijo": "2100",
+                                     "Ico_PrefijoLogo": "2100", "Ico_Opcion": "101"})
+        tag_m = re.search(r'<[Ii][Nn][Pp][Uu][Tt][^>]+name="Ico_Desafio"[^>]*>', r.text)
+        desafio = ""
+        if tag_m:
+            val_m = re.search(r'value="([^"]*)"', tag_m.group(0))
+            desafio = val_m.group(1) if val_m else ""
+        logger.info(f"canales login: {r.status_code}, Ico_Desafio: '{desafio}'")
+
+        f5_m = re.search(r"f5_p:'([A-Z]+)'", r.text)
+        f5_name_m = re.search(r"cookie='(f5avr[^=]+)=", r.text)
+        if f5_m and f5_name_m:
+            f5_val = _f5_cookie_value(f5_m.group(1), latency_ms=523)
+            client.cookies.set(f5_name_m.group(1), f5_val, domain="canales.redsys.es")
+
+        r2 = await client.post(
+            f"{login_base}/canales/login",
+            headers={"Referer": str(r.url)},
+            data={
+                "Ico_Idioma": "1", "Ico_Prefijo": "2100", "Ico_PrefijoLogo": "2100",
+                "Ico_Opcion": "103", "Ico_Usuario": usuario, "Ico_Password": password,
+                "Ico_Certificado": "", "Ico_Desafio": desafio, "isIframe": "true",
+            },
+        )
+        logger.info(f"canales login POST: {r2.status_code}, URL: {r2.url}")
+
+        # STEP 2: presentaMenu con sesión de canales → JSESSIONID de tpvpc
+        canales_jsid = None
+        for raw_c in client.cookies.jar:
+            if raw_c.name == "JSESSIONID" and "canales" in str(raw_c.domain):
+                canales_jsid = raw_c.value
+                logger.info(f"canales JSESSIONID: {canales_jsid[:20]}")
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15, headers=headers) as tc:
+            if canales_jsid:
+                tc.cookies.set("JSESSIONID", canales_jsid, domain="tpvpc.redsys.es")
+            rt = await tc.get("https://tpvpc.redsys.es/TPV_PC/presentaMenu")
+            logger.info(f"presentaMenu: {rt.status_code}, URL: {rt.url}")
+            tpvpc_jsid = None
+            for sc in rt.headers.get_list("set-cookie"):
+                if "JSESSIONID" in sc:
+                    m_sc = re.search(r"JSESSIONID=([^;,\s]+)", sc)
+                    if m_sc:
+                        tpvpc_jsid = m_sc.group(1)
+                        logger.info(f"tpvpc JSESSIONID (presentaMenu): {tpvpc_jsid[:30]}")
+            if not tpvpc_jsid:
+                m_url = re.search(r"jsessionid=([^;?&\"'\s]+)", str(rt.url))
+                if m_url:
+                    tpvpc_jsid = m_url.group(1)
+            if tpvpc_jsid:
+                return tpvpc_jsid
+
+        raise RuntimeError("No JSESSIONID from presentaMenu")
+
+# ---------------------------------------------------------------------------
 # Initialization
 # ---------------------------------------------------------------------------
 
 async def initialize(comercio: str, terminal: str, com_port: str, timeout: int) -> None:
-    global _initialized, _pinpad_ws
+    global _initialized, _pinpad_ws, _mgmt_ws
 
     logger.info("Iniciando conexion con TpvpcWinService...")
 
-    # Connect to management WebSocket to get pinpad address
-    try:
-        async with websockets.connect(MGMT_WS_URL, open_timeout=5) as mgmt_ws:
-            client_id = str(int(time.time() * 1000))
-            await mgmt_ws.send(json.dumps({
-                "ClientId": client_id,
-                "Command": "Init",
-                "Args": ["0"],
-            }))
-            raw = await asyncio.wait_for(mgmt_ws.recv(), timeout=5)
-            response = json.loads(raw)
-            logger.info(f"Management response: {response}")
-    except Exception as e:
-        logger.warning(f"Management service error: {e} - continuando con defaults")
+    # Cerrar conexiones previas para que TpvpcWinService mate TpvpcPinpad y libere COM port
+    if _pinpad_ws:
+        try:
+            await _pinpad_ws.close()
+        except Exception:
+            pass
+    if _mgmt_ws:
+        try:
+            await _mgmt_ws.close()
+        except Exception:
+            pass
+    await asyncio.sleep(2)
 
-    # Initialize pinpad via HTTP
-    usuario = comercio + "2100"
+    # STEP 1: Management WS
+    _mgmt_ws = await websockets.connect(MGMT_WS_URL, open_timeout=5)
+    client_id = str(int(time.time() * 1000))
+    await _mgmt_ws.send(json.dumps({"ClientId": client_id, "Command": "Init", "Args": ["0"]}))
+    raw = await asyncio.wait_for(_mgmt_ws.recv(), timeout=5)
+    response = json.loads(raw)
+    logger.info(f"Management response: {response}")
+
+    pinpad_address = response.get("DataResponse", {}).get("PinPadAddress", "localhost:9000")
+    pinpad_ws_url = f"ws://{pinpad_address}/"
+    pinpad_http_url = f"http://{pinpad_address}"
+    global PINPAD_HTTP_URL
+    PINPAD_HTTP_URL = pinpad_http_url
+    logger.info(f"PinPad address: {pinpad_address}")
+
+    # STEP 2: Auth directo a tpvpc.redsys.es via comprobarEntrada (SHA1 password)
+    usuario = cfg.get("redsys_usuario", "")
+    password = cfg.get("redsys_password", "")
+    jsessionid = None
+    if usuario and password:
+        try:
+            jsessionid = await get_fresh_jsessionid(usuario, password)
+            logger.info(f"jsessionid: {jsessionid[:30]}")
+        except Exception as e:
+            logger.warning(f"Auth failed: {e} — continuando sin sesion")
+
+    # STEP 3: Conectar WS :9000 ANTES de HTTP calls (secuencia exacta del browser)
+    logger.info(f"Conectando WebSocket eventos pinpad {pinpad_ws_url}")
+    _pinpad_ws = await websockets.connect(pinpad_ws_url, open_timeout=5)
+
+    # STEP 4: Secuencia HTTP exacta del browser (HAR verificado)
+    logger.info("SetProp Usuario")
     await _set_prop("Usuario", usuario)
-    await _set_int_prop("TimeOut", timeout)
+    await asyncio.sleep(0.5)
+    logger.info("SetIntProp TimeOut")
+    await _set_int_prop("TimeOut", cfg.get("timeout", 45))
+    logger.info("SetProp Version 8.1")
     await _set_prop("Version", "8.1")
 
-    # EstConfSesion - try with fallback session
-    try:
-        await _exec_func("EstConfSesion", [SESSION_URL, JSESSIONID_FALLBACK])
-    except Exception as e:
-        logger.warning(f"EstConfSesion failed: {e} - continuando sin sesion")
+    if jsessionid:
+        session_url = f"{SESSION_VALIDATE_URL};jsessionid={jsessionid}"
+        logger.info(f"EstConfSesion: {session_url[:70]}")
+        result = await _exec_func("EstConfSesion", [session_url, jsessionid])
+        logger.info(f"EstConfSesion result: {result}")
 
-    # IniciaComunicacion
-    await _exec_func("IniciaComunicacion", [comercio, terminal, WSDL_URL, "PAGO", com_port])
-    logger.info("IniciaComunicacion enviado")
+    logger.info(f"IniciaComunicacion -> {pinpad_http_url}")
+    result = await _exec_func("IniciaComunicacion", [comercio, terminal, WSDL_URL, "PAGO", com_port])
+    logger.info(f"IniciaComunicacion result: {result}")
 
-    # Connect WebSocket for async events
-    _pinpad_ws = await websockets.connect(PINPAD_WS_URL, open_timeout=5)
+    # STEP 5: Esperar pinpadIE_Inicializado en WS :9000
+    deadline = asyncio.get_event_loop().time() + 20
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            raise RuntimeError("Timeout esperando pinpadIE_Inicializado")
+        init_event = await asyncio.wait_for(_pinpad_ws.recv(), timeout=remaining)
+        logger.info(f"Pinpad init event: {init_event}")
+        if init_event == "pinpadIE_Inicializado":
+            break
+        if init_event in ("pinpadIE_SesionInvalida", "pinpadIE__IPinPadIEEvents_Event_Error"):
+            raise RuntimeError(f"{init_event}")
+
     asyncio.create_task(_event_listener())
-
     _initialized = True
-    logger.info("Datafono inicializado correctamente")
+    logger.info("Datafono listo")
 
 
 async def _event_listener() -> None:
@@ -141,7 +280,7 @@ async def _event_listener() -> None:
             if _pending_future and not _pending_future.done():
                 if message == "pinpadIE_FinTransaccion":
                     _pending_future.set_result({"status": "done"})
-                elif message == "pinpadIE_LecturaOK":
+                elif message in ("pinpadIE_EsperandoTarjeta", "pinpadIE_LecturaOK"):
                     pass  # wait for FinTransaccion
                 elif message == "pinpadIE_ErrorTransaccion":
                     _pending_future.set_result({"status": "error", "event": message})
@@ -154,6 +293,8 @@ async def _event_listener() -> None:
         logger.warning("WebSocket cerrado - marcando como no inicializado")
         _initialized = False
         _pinpad_ws = None
+        if _mgmt_ws:
+            await _mgmt_ws.close()
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -189,15 +330,15 @@ async def pay(req: PayRequest):
             try:
                 await initialize(comercio, terminal, com_port, req.timeout)
             except Exception as e:
-                raise HTTPException(status_code=503, detail=f"No se pudo inicializar el datafono: {e}")
+                raise HTTPException(status_code=503, detail=f"No se pudo inicializar el datafono: {type(e).__name__}: {e}")
 
-        # Set payment properties
-        cents = str(int(round(req.amount * 100))).zfill(12)
-        await _set_prop("Importe", cents)
+        # Set payment properties (order and values match browser HAR)
+        await _set_prop("OpcionesPagoCaixa", "N")
+        await _set_prop("Importe", str(req.amount))
         await _set_prop("Moneda", "978")  # EUR
         await _set_prop("Factura", req.invoice[:12])
         await _set_prop("TipoOperacion", "PAGO")
-        await _set_prop("OpcionesPago", "")
+        await _set_prop("OpcionesPago", "S")
 
         # Create future for async event
         loop = asyncio.get_event_loop()
@@ -223,6 +364,62 @@ async def pay(req: PayRequest):
         return {"authorized": False, "error": "Operacion cancelada"}
     else:
         return {"authorized": False, "error": f"Error en datafono: {result.get('event', 'unknown')}"}
+
+
+@app.get("/debug")
+async def debug():
+    results = {}
+
+    # COM ports via mode command
+    try:
+        out = subprocess.check_output("mode", shell=True, text=True, timeout=5, stderr=subprocess.STDOUT)
+        results["com_ports"] = out
+    except Exception as e:
+        results["com_ports"] = f"ERROR: {e}"
+
+    # Tpvpc services
+    try:
+        out = subprocess.check_output(
+            'sc query type= all state= all | findstr /i "tpvpc\\|pinpad\\|redsys"',
+            shell=True, text=True, timeout=5, stderr=subprocess.STDOUT
+        )
+        results["services"] = out
+    except Exception as e:
+        results["services"] = f"ERROR: {e}"
+
+    # Port 9000 listening
+    try:
+        out = subprocess.check_output(
+            "netstat -an | findstr :9000",
+            shell=True, text=True, timeout=5, stderr=subprocess.STDOUT
+        )
+        results["port_9000"] = out
+    except Exception as e:
+        results["port_9000"] = f"ERROR (probablemente no escucha): {e}"
+
+    # Port 10200 listening
+    try:
+        out = subprocess.check_output(
+            "netstat -an | findstr :10200",
+            shell=True, text=True, timeout=5, stderr=subprocess.STDOUT
+        )
+        results["port_10200"] = out
+    except Exception as e:
+        results["port_10200"] = f"ERROR (probablemente no escucha): {e}"
+
+    # Pinpad HTTP ping
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(PINPAD_HTTP_URL)
+            results["pinpad_http"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        results["pinpad_http"] = f"ERROR: {type(e).__name__}: {e}"
+
+    # Config
+    results["config"] = cfg
+    results["initialized"] = _initialized
+
+    return results
 
 
 @app.post("/cancel")

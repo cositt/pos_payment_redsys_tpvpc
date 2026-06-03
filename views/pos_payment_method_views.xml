@@ -8,10 +8,15 @@
             <xpath expr="//form/sheet" position="inside">
                 <group string="Redsys TPV-PC" invisible="not redsys_enabled">
                     <group string="Conexión">
-                        <field name="redsys_proxy_url" placeholder="http://10.0.1.50:8765"/>
+                        <field name="redsys_proxy_url" placeholder="http://10.0.1.21:8765"/>
                         <field name="redsys_comercio" placeholder="369559141"/>
                         <field name="redsys_terminal" placeholder="1"/>
+                        <field name="redsys_com_port" placeholder="COM9:,19200,N,8,1"/>
                         <field name="redsys_timeout"/>
+                    </group>
+                    <group string="Credenciales Redsys">
+                        <field name="redsys_usuario" placeholder="3695591412100"/>
+                        <field name="redsys_password" password="True"/>
                     </group>
                     <group string="Estado">
                         <field name="redsys_proxy_status" readonly="1"/>
