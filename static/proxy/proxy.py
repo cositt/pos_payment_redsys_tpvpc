@@ -66,6 +66,11 @@ _mgmt_ws: Optional[websockets.WebSocketClientProtocol] = None
 _pending_future: Optional[asyncio.Future] = None
 _lock = asyncio.Lock()
 
+# Cached Redsys session — avoid repeated logins that trigger account lockout
+_cached_jsessionid: Optional[str] = None
+_jsession_expiry: float = 0.0
+SESSION_TTL_SECONDS: int = cfg.get("session_ttl_seconds", 1800)  # 30 min default
+
 # ---------------------------------------------------------------------------
 # PinPad HTTP helpers
 # ---------------------------------------------------------------------------
@@ -220,16 +225,25 @@ async def initialize(comercio: str, terminal: str, com_port: str, timeout: int) 
     PINPAD_HTTP_URL = pinpad_http_url
     logger.info(f"PinPad address: {pinpad_address}")
 
-    # STEP 2: Auth directo a tpvpc.redsys.es via comprobarEntrada (SHA1 password)
+    # STEP 2: Auth — reuse cached jsessionid if still valid to avoid lockouts
+    global _cached_jsessionid, _jsession_expiry
     usuario = cfg.get("redsys_usuario", "")
     password = cfg.get("redsys_password", "")
     jsessionid = None
     if usuario and password:
-        try:
-            jsessionid = await get_fresh_jsessionid(usuario, password)
-            logger.info(f"jsessionid: {jsessionid[:30]}")
-        except Exception as e:
-            logger.warning(f"Auth failed: {e} — continuando sin sesion")
+        now = time.time()
+        if _cached_jsessionid and now < _jsession_expiry:
+            jsessionid = _cached_jsessionid
+            remaining = int(_jsession_expiry - now)
+            logger.info(f"Reutilizando jsessionid cacheado (expira en {remaining}s): {jsessionid[:30]}")
+        else:
+            try:
+                jsessionid = await get_fresh_jsessionid(usuario, password)
+                _cached_jsessionid = jsessionid
+                _jsession_expiry = time.time() + SESSION_TTL_SECONDS
+                logger.info(f"Nuevo jsessionid obtenido (TTL {SESSION_TTL_SECONDS}s): {jsessionid[:30]}")
+            except Exception as e:
+                logger.warning(f"Auth failed: {e} — continuando sin sesion")
 
     # STEP 3: Conectar WS :9000 ANTES de HTTP calls (secuencia exacta del browser)
     logger.info(f"Conectando WebSocket eventos pinpad {pinpad_ws_url}")
@@ -288,6 +302,9 @@ async def _event_listener() -> None:
                     _pending_future.set_result({"status": "cancelled"})
                 elif message == "pinpadIE_SesionInvalida":
                     _initialized = False
+                    _cached_jsessionid = None
+                    _jsession_expiry = 0.0
+                    logger.warning("SesionInvalida — cache de jsessionid borrado, forzara re-auth")
                     _pending_future.set_result({"status": "error", "event": "session_invalid"})
     except websockets.exceptions.ConnectionClosed:
         logger.warning("WebSocket cerrado - marcando como no inicializado")
@@ -314,7 +331,13 @@ class PayRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "initialized": _initialized}
+    session_ttl_remaining = max(0, int(_jsession_expiry - time.time())) if _cached_jsessionid else 0
+    return {
+        "status": "ok",
+        "initialized": _initialized,
+        "session_cached": _cached_jsessionid is not None,
+        "session_ttl_remaining_s": session_ttl_remaining,
+    }
 
 
 @app.post("/pay")
