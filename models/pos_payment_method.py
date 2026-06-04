@@ -10,6 +10,11 @@ _logger = logging.getLogger(__name__)
 class PosPaymentMethod(models.Model):
     _inherit = "pos.payment.method"
 
+    use_payment_terminal = fields.Selection(
+        selection_add=[("redsys_tpvpc", "Redsys TPV-PC")],
+        ondelete={"redsys_tpvpc": "set default"},
+    )
+
     redsys_enabled = fields.Boolean(
         string="Habilitar Redsys TPV-PC",
         default=False,
