@@ -19,7 +19,7 @@
     """,
     "author": "Juan Cositt",
     "license": "LGPL-3",
-    "depends": ["point_of_sale"],
+    "depends": ["point_of_sale", "pos_self_order"],
     "assets": {
         "point_of_sale._assets_pos": [
             "pos_payment_redsys_tpvpc/static/src/js/payment_redsys.js",

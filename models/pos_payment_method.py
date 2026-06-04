@@ -97,6 +97,32 @@ class PosPaymentMethod(models.Model):
             "target": "new",
         }
 
+    def _payment_request_from_kiosk(self, order):
+        self.ensure_one()
+        if self.use_payment_terminal != 'redsys_tpvpc':
+            return super()._payment_request_from_kiosk(order)
+
+        result = self.redsys_send_payment(
+            self.id,
+            order.amount_total,
+            order.pos_reference or order.name,
+        )
+
+        if result.get('authorized'):
+            order.add_payment({
+                'amount': order.amount_total,
+                'payment_date': fields.Datetime.now(),
+                'payment_method_id': self.id,
+                'ticket': result.get('receipt', ''),
+                'pos_order_id': order.id,
+            })
+            order.action_pos_order_paid()
+            order._send_payment_result('Success')
+            return True
+
+        order._send_payment_result('Failure')
+        return False
+
     def redsys_send_payment(self, payment_method_id: int, amount: float, invoice_ref: str) -> dict:
         method = self.browse(payment_method_id)
         try:

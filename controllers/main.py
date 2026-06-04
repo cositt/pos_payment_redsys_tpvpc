@@ -12,13 +12,13 @@ _PROXY_FILES = {"proxy.py", "requirements.txt", "install.bat"}
 
 class RedsysController(http.Controller):
 
-    @http.route("/pos/redsys/pay", type="json", auth="user")
+    @http.route("/pos/redsys/pay", type="jsonrpc", auth="user")
     def pay(self, payment_method_id: int, amount: float, invoice_ref: str):
         return request.env["pos.payment.method"].redsys_send_payment(
             payment_method_id, amount, invoice_ref
         )
 
-    @http.route("/pos/redsys/cancel", type="json", auth="user")
+    @http.route("/pos/redsys/cancel", type="jsonrpc", auth="user")
     def cancel(self, payment_method_id: int):
         return request.env["pos.payment.method"].redsys_cancel_payment(payment_method_id)
 
