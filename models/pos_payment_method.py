@@ -14,6 +14,13 @@ class PosPaymentMethod(models.Model):
     def _get_payment_terminal_selection(self):
         return super()._get_payment_terminal_selection() + [("redsys_tpvpc", "Redsys TPV-PC")]
 
+    @api.onchange("redsys_enabled")
+    def _onchange_redsys_enabled(self):
+        if self.redsys_enabled:
+            self.use_payment_terminal = "redsys_tpvpc"
+        elif self.use_payment_terminal == "redsys_tpvpc":
+            self.use_payment_terminal = False
+
     redsys_enabled = fields.Boolean(
         string="Habilitar Redsys TPV-PC",
         default=False,

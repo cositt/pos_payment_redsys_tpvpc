@@ -26,6 +26,7 @@
                 </group>
                 <group string="Habilitar Redsys TPV-PC">
                     <field name="redsys_enabled"/>
+                    <field name="use_payment_terminal" invisible="not redsys_enabled" readonly="1"/>
                 </group>
             </xpath>
         </field>
